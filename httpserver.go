@@ -11,21 +11,17 @@ import (
 )
 
 var (
-	logger      *log.Logger
-	workingDir  string
+	logger      = log.Default()
 	uploadMutex sync.Map
 )
 
-const RW_BUFFER_SIZE = 1024 * 1024
+const (
+	DataDir                       = "/tmp"
+	MaxWriteBufferSizeBytes int64 = 64 * 1024
+	MaxReadBufferSizeBytes  int64 = 1024 * 1024
+)
 
 func main() {
-	logger = log.Default()
-	var err error
-	workingDir, err = os.Getwd()
-	if err != nil {
-		logger.Panic(err)
-	}
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		logger.Println(r.Method, r.URL.Path)
 
@@ -53,56 +49,71 @@ func main() {
 		w.Write([]byte(now))
 	})
 
-    logger.Println("Server start");
-	logger.Fatal(http.ListenAndServe(":80", nil))
+	logger.Println("Server start")
+	logger.Fatal(http.ListenAndServe(":8001", nil))
 }
 
 func postHandler(w http.ResponseWriter, r *http.Request) {
-	filePath := getFullFilePath(r.URL.Path)
+	uri := r.URL.Path
+	_, uploadingInProgress := uploadMutex.LoadOrStore(uri, true)
+	if uploadingInProgress {
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	defer func() {
+		uploadMutex.Delete(uri)
+	}()
 
-	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		logger.Println("POST openfile err", filePath, err.Error())
+	if err := processFileUpload(r); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func processFileUpload(r *http.Request) error {
+	filePath := getFullFilePath(r.URL.Path)
+
+	file, openFileErr := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0660)
+	if openFileErr != nil {
+		logger.Println("POST openfile err", filePath, openFileErr.Error())
+		return openFileErr
+	}
 	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
+		if err := file.Close(); err != nil {
 			logger.Println("POST closefile err", filePath, err.Error())
 		}
 	}(file)
 
-	uploadMutex.Store(filePath, true)
-	defer func() {
-		uploadMutex.Delete(filePath)
-	}()
+	defer func(Body io.ReadCloser) {
+		if err := Body.Close(); err != nil {
+			logger.Println("POST closebody err", filePath, err.Error())
+		}
+	}(r.Body)
 
-	var totalReadBytes int
+	var postBytesTotal int
 	for {
-		buffer := make([]byte, 2*RW_BUFFER_SIZE)
-		readBytes, err := r.Body.Read(buffer)
+		buffer := make([]byte, MaxWriteBufferSizeBytes)
+		postBytes, readErr := r.Body.Read(buffer)
 
-		if readBytes != 0 {
-			totalReadBytes += readBytes
-			_, err = file.Write(buffer[:readBytes])
-			if err != nil {
-				logger.Println("Write file error", filePath)
-				return
+		if postBytes != 0 {
+			postBytesTotal += postBytes
+			_, writeErr := file.Write(buffer[:postBytes])
+			if writeErr != nil {
+				logger.Println("Write file error", filePath, writeErr)
+				return writeErr
 			}
 		}
 
-		switch err {
+		switch readErr {
 		case nil:
 			continue
 		case io.EOF:
-			logger.Println("POST EOF", filePath, totalReadBytes)
-			w.WriteHeader(http.StatusOK)
-			return
+			logger.Println("POST EOF", filePath, postBytesTotal)
+			return nil
 		default:
-			logger.Println("POST err", filePath, err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+			logger.Println("POST read body error", filePath, readErr.Error())
+			return readErr
 		}
 	}
 }
@@ -128,36 +139,43 @@ func optionsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getHandler(w http.ResponseWriter, r *http.Request) {
+	uri := r.URL.Path
 	filePath := getFullFilePath(r.URL.Path)
 	if !fileExists(filePath) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	_, uploading := uploadMutex.Load(filePath)
-	if fileExists(filePath) && !uploading {
-		http.ServeFile(w, r, filePath)
+	_, uploading := uploadMutex.Load(uri)
+	if uploading {
+		if err := serveUploadingFile(w, r); err != nil {
+			msg := fmt.Sprintf("Serve uploading file error %s:%s", uri, err.Error())
+			http.Error(w, msg, http.StatusInternalServerError)
+			return
+		}
 		return
 	}
 
+	http.ServeFile(w, r, filePath)
+}
+
+func serveUploadingFile(w http.ResponseWriter, r *http.Request) error {
+	uri := r.URL.Path
+	filePath := getFullFilePath(uri)
 	file, err := os.Open(filePath)
 	if err != nil {
-		msg := fmt.Sprintf("Error reading file %s:%s", filePath, err.Error())
-		http.Error(w, msg, http.StatusInternalServerError)
-		return
+		return err
 	}
 	defer func(f *os.File) {
 		err := f.Close()
 		if err != nil {
-			logger.Println("Closefile error", f.Name(), err.Error())
+			logger.Println("Close file error", f.Name(), err.Error())
 		}
 	}(file)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		msg := fmt.Sprintf("expected http.ResponseWriter to be an http.Flusher")
-		http.Error(w, msg, http.StatusInternalServerError)
-		return
+		return fmt.Errorf("expected http.ResponseWriter to be an http.Flusher")
 	}
 
 	connectionClosed := false
@@ -166,20 +184,30 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 		connectionClosed = true
 	}()
 
-	var offset int64
+	var readOffset int64
 	for {
 		if connectionClosed {
-			logger.Println(fmt.Sprintf("%s conection closed", filePath))
-			return
+			logger.Println(fmt.Sprintf("GET %s conection closed %d", filePath, readOffset))
+			return nil
 		}
 
-		buffer := make([]byte, RW_BUFFER_SIZE)
-		readBytes, readErr := file.ReadAt(buffer, offset)
+		fi, err := file.Stat()
+		if err != nil {
+			return err
+		}
+
+		readBufferSizeBytes := fi.Size() - readOffset + 1
+		if readBufferSizeBytes > MaxReadBufferSizeBytes {
+			readBufferSizeBytes = MaxReadBufferSizeBytes
+		}
+
+		buffer := make([]byte, readBufferSizeBytes)
+		readBytes, readErr := file.ReadAt(buffer, readOffset)
 		if readBytes != 0 {
-			offset += int64(readBytes)
+			readOffset += int64(readBytes)
 			if _, writeErr := w.Write(buffer[:readBytes]); writeErr != nil {
-				logger.Println("Write error ", writeErr)
-				return
+				logger.Println("HTTP write error ", writeErr)
+				return writeErr
 			}
 			flusher.Flush()
 		}
@@ -188,16 +216,16 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 		case nil:
 			continue
 		case io.EOF:
-			_, uploading := uploadMutex.Load(filePath)
+			_, uploading := uploadMutex.Load(uri)
 			if uploading {
 				continue
 			}
-			logger.Println(fmt.Sprintf("%s read done %d", filePath, offset+int64(readBytes)))
-			return
+			logger.Println("GET EOF", filePath, readOffset)
+			return nil
 		default:
 			msg := fmt.Sprintf("file.ReadAt error:%s", readErr.Error())
 			logger.Println(msg)
-			return
+			return readErr
 		}
 	}
 }
@@ -217,5 +245,5 @@ func fileExists(filePath string) bool {
 }
 
 func getFullFilePath(f string) string {
-	return workingDir + f
+	return DataDir + f
 }

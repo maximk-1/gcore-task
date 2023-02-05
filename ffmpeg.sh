@@ -55,7 +55,7 @@ ffmpeg -y -hwaccel auto -fflags +flush_packets+genpts -re -i "$source" \
   $profile_480 $profile_720 $profile_1080 $audio \
   -export_side_data prft \
   -dash_segment_type mp4 -streaming 1 -index_correction 1 -ldash 1 \
-  -seg_duration $seg_duration -frag_duration $idr -window_size 5 \
+  -seg_duration $seg_duration -frag_duration 0.2 -window_size 5 \
   -use_timeline 0 -use_template 1 -write_prft 1 -target_latency 3 -utc_timing_url "/time" \
   -frag_type duration -adaptation_sets "id=0,streams=v id=1,streams=a" \
   -format_options "movflags=+frag_keyframe+empty_moov+cmaf" \
